@@ -116,6 +116,7 @@ make sync7
 make compute7
 make report7
 make candidates
+make smoke
 ```
 
 ## Report
