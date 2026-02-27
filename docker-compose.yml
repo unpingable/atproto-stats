@@ -1,0 +1,11 @@
+services:
+  bsky-noise:
+    build: .
+    environment:
+      - XDG_CONFIG_HOME=/config
+      - BSKY_DB_PATH=/data/bsky_noise.db
+    volumes:
+      - ./config:/config
+      - ./data:/data
+      - ./output:/output
+    entrypoint: ["bsky_noise"]
