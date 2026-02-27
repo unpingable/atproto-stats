@@ -72,7 +72,7 @@ Auto-degraded (switches to degraded behavior after 429/5xx/timeouts):
 bsky_noise sync --window 7 --auto-degraded --verbose
 ```
 
-## Candidates (Follow-Back Roulette)
+## Candidates (Orbit Discovery)
 
 Build an orbit candidate pool from followers you do not currently follow:
 
@@ -104,6 +104,16 @@ Materialize derived summary JSON from local data (cron-safe):
 
 ```bash
 bsky_noise compute --window 7 --compare-prior --summary-output output/summary.json
+```
+
+## Make Shortcuts
+
+```bash
+make test
+make sync7
+make compute7
+make report7
+make candidates
 ```
 
 ## Report
@@ -169,6 +179,7 @@ printf '%s' 'xxxx-xxxx-xxxx-xxxx' | docker compose run --rm bsky-noise auth --ha
 - [DESIGN_NOTES.md](DESIGN_NOTES.md)
 - [ROADMAP.md](ROADMAP.md)
 - [PROVENANCE.md](PROVENANCE.md)
+- [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 
