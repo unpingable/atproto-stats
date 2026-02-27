@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Iterable
 
 from .db import get_latest_sync_run, init_db, write_samples
@@ -70,6 +71,93 @@ def _noise_score(metrics: Metrics, weights: dict[str, float]) -> float:
         + metrics.replies * weights["replies"]
         + metrics.reposts * weights["reposts"]
     )
+
+
+def _materialize_day_counts(conn, *, weights: dict[str, float], lookback_days: int) -> None:
+    start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).date().isoformat()
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("DELETE FROM did_day_counts WHERE day >= ?", (start,))
+    cur = conn.execute(
+        """
+        SELECT
+          did,
+          substr(created_at, 1, 10) AS day,
+          SUM(CASE WHEN kind = 'post' THEN 1 ELSE 0 END) AS posts,
+          SUM(CASE WHEN kind = 'reply' THEN 1 ELSE 0 END) AS replies,
+          SUM(CASE WHEN kind = 'repost' THEN 1 ELSE 0 END) AS reposts
+        FROM events
+        WHERE created_at >= ?
+        GROUP BY did, day
+        """,
+        (start,),
+    )
+    rows = []
+    for row in cur.fetchall():
+        posts = int(row["posts"] or 0)
+        replies = int(row["replies"] or 0)
+        reposts = int(row["reposts"] or 0)
+        noise_score_day = (
+            posts * weights["posts"]
+            + replies * weights["replies"]
+            + reposts * weights["reposts"]
+        )
+        rows.append((row["did"], row["day"], posts, replies, reposts, noise_score_day))
+    if rows:
+        conn.executemany(
+            """
+            INSERT INTO did_day_counts (did, day, posts, replies, reposts, noise_score_day)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(did, day) DO UPDATE SET
+              posts = excluded.posts,
+              replies = excluded.replies,
+              reposts = excluded.reposts,
+              noise_score_day = excluded.noise_score_day
+            """,
+            rows,
+        )
+    conn.commit()
+
+
+def _series_for_window(conn, did: str, window_days: int) -> list[float]:
+    start = (datetime.now(timezone.utc) - timedelta(days=window_days)).date().isoformat()
+    cur = conn.execute(
+        """
+        SELECT noise_score_day
+        FROM did_day_counts
+        WHERE did = ? AND day >= ?
+        ORDER BY day
+        """,
+        (did, start),
+    )
+    return [float(r["noise_score_day"] or 0.0) for r in cur.fetchall()]
+
+
+def _burst_spike(series: list[float]) -> tuple[float, float]:
+    if not series:
+        return 0.0, 0.0
+    peak = max(series)
+    med = median(series)
+    burst = peak / med if med > 0 else (peak if peak > 0 else 0.0)
+    today = series[-1]
+    avg = sum(series) / len(series)
+    spike = today / avg if avg > 0 else 0.0
+    return burst, spike
+
+
+def _health_status(run_health: dict[str, Any] | None) -> str:
+    if not run_health:
+        return "partial"
+    if run_health["events_fetched"] == 0 and run_health["follows_count"] > 0:
+        return "partial"
+    if (
+        run_health["auto_degraded_tripped"]
+        or run_health["rate_limit_count"] > 0
+        or run_health["server_error_count"] > 0
+        or run_health["timeout_count"] > 0
+        or run_health["request_error_count"] > 0
+    ):
+        return "degraded"
+    return "good"
 
 
 def _reason_label(window_data: dict[str, Any]) -> str:
@@ -150,6 +238,8 @@ def build_summary(
 ) -> dict[str, Any]:
     init_db(conn)
     windows = sorted(set(windows))
+    max_window = max(windows) if windows else 30
+    _materialize_day_counts(conn, weights=weights, lookback_days=max_window * 2 + 7)
     accounts = conn.execute(
         "SELECT did, handle, display_name FROM accounts ORDER BY handle"
     ).fetchall()
@@ -179,6 +269,7 @@ def build_summary(
             "request_error_count": latest_run["request_error_count"],
             "auto_degraded_tripped": bool(latest_run["auto_degraded_tripped"]),
         }
+    summary["run_health_status"] = _health_status(summary["run_health"])
 
     # First pass computes per-account per-window raw metrics.
     for row in accounts:
@@ -197,6 +288,8 @@ def build_summary(
             score = _noise_score(current, weights)
             prior_score = _noise_score(prior, weights)
             delta_score = score - prior_score if compare_prior else 0.0
+            series = _series_for_window(conn, did, window)
+            burst_score, spike_today = _burst_spike(series)
             account_entry["windows"][str(window)] = {
                 "counts": current.__dict__,
                 "prior_counts": prior.__dict__,
@@ -205,6 +298,8 @@ def build_summary(
                 "prior_noise_score": prior_score,
                 "delta_score": delta_score,
                 "attention_share": 0.0,
+                "burst_score": burst_score,
+                "spike_today_ratio": spike_today,
             }
             write_samples(
                 conn,
@@ -247,6 +342,8 @@ def _write_csv_export(summary: dict[str, Any], csv_path: Path) -> None:
         "attention_share",
         "delta_score",
         "reason_label",
+        "burst_score",
+        "spike_today_ratio",
         "posts",
         "replies",
         "reposts",
@@ -271,6 +368,8 @@ def _write_csv_export(summary: dict[str, Any], csv_path: Path) -> None:
                         "attention_share": f"{window['attention_share']:.6f}",
                         "delta_score": f"{window['delta_score']:.4f}",
                         "reason_label": _reason_label(window),
+                        "burst_score": f"{window['burst_score']:.4f}",
+                        "spike_today_ratio": f"{window['spike_today_ratio']:.4f}",
                         "posts": window["counts"]["posts"],
                         "replies": window["counts"]["replies"],
                         "reposts": window["counts"]["reposts"],
@@ -366,6 +465,19 @@ def _render_html(summary: dict[str, Any]) -> str:
       padding: 12px;
       box-shadow: var(--shadow);
     }
+    .status-pill {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+    }
+    .status-good { background: #2f7d32; color: #fff; }
+    .status-degraded { background: #b35a00; color: #fff; }
+    .status-partial { background: #7a7a7a; color: #fff; }
     .cards {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
@@ -506,11 +618,29 @@ def _render_html(summary: dict[str, Any]) -> str:
     function renderHealth() {
       const health = summary.run_health;
       const el = document.getElementById('health');
+      const status = summary.run_health_status || 'partial';
+      const statusClass = `status-pill status-${status}`;
       if (!health) {
-        el.textContent = 'Run quality: no sync receipt found yet.';
+        el.innerHTML = `Run quality: no sync receipt found yet. <span class=\"${statusClass}\">${status}</span>`;
         return;
       }
-      el.innerHTML = `Run quality: fetched=<b>${health.events_fetched}</b> inserted=<b>${health.events_inserted}</b> requests=${health.request_count} retries=${health.retry_count} 429=${health.rate_limit_count} 5xx=${health.server_error_count} timeouts=${health.timeout_count} degraded=${health.auto_degraded_tripped ? 'yes' : 'no'}`;
+      el.innerHTML = `
+        <div>
+          Run quality
+          <span class=\"${statusClass}\">${status}</span>
+        </div>
+        <details>
+          <summary>Show receipt details</summary>
+          <div class=\"note\">
+            fetched=${health.events_fetched} inserted=${health.events_inserted}
+            · requests=${health.request_count} retries=${health.retry_count}
+            · 429=${health.rate_limit_count} 5xx=${health.server_error_count}
+            · timeouts=${health.timeout_count}
+            · request_errors=${health.request_error_count}
+            · degraded_tripped=${health.auto_degraded_tripped ? 'yes' : 'no'}
+          </div>
+        </details>
+      `;
     }
 
     function renderTable(el, rows, cols) {
@@ -536,6 +666,8 @@ def _render_html(summary: dict[str, Any]) -> str:
             score: w.noise_score,
             share: w.attention_share,
             delta_score: w.delta_score,
+            burst_score: w.burst_score,
+            spike_today_ratio: w.spike_today_ratio,
             posts: w.counts.posts,
             replies: w.counts.replies,
             reposts: w.counts.reposts,
@@ -595,6 +727,7 @@ def _render_html(summary: dict[str, Any]) -> str:
         { key: 'score', label: 'Score', num: true, fmt: fmtNum },
         { key: 'share', label: 'Share', num: true, fmt: fmtPct },
         { key: 'delta_score', label: 'Delta', num: true, fmt: fmtNum },
+        { key: 'burst_score', label: 'Burst', num: true, fmt: fmtNum },
       ]);
 
       renderTable(document.getElementById('topByDelta'), ranking.top_by_delta.slice(0, 15), [
@@ -611,6 +744,8 @@ def _render_html(summary: dict[str, Any]) -> str:
         { key: 'score', label: 'Score', num: true, fmt: fmtNum },
         { key: 'share', label: 'Share', num: true, fmt: fmtPct },
         { key: 'delta_score', label: 'Delta', num: true, fmt: fmtNum },
+        { key: 'burst_score', label: 'Burst', num: true, fmt: fmtNum },
+        { key: 'spike_today_ratio', label: 'Spike', num: true, fmt: fmtNum },
         { key: 'posts', label: 'Posts', num: true },
         { key: 'replies', label: 'Replies', num: true },
         { key: 'reposts', label: 'Reposts', num: true },

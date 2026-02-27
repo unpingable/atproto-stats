@@ -39,3 +39,6 @@ def test_report_generation(tmp_path: Path):
     assert data["accounts"][0]["windows"]["30"]["counts"]["posts"] == 1
     assert summary["accounts"][0]["windows"]["30"]["counts"]["replies"] == 1
     assert "reason_label" in data["rankings"]["30"]["top_by_delta"][0]
+    assert "burst_score" in data["accounts"][0]["windows"]["30"]
+    assert "spike_today_ratio" in data["accounts"][0]["windows"]["30"]
+    assert data["run_health_status"] in {"good", "degraded", "partial"}

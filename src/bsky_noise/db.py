@@ -131,6 +131,19 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS did_day_counts (
+            did TEXT NOT NULL,
+            day TEXT NOT NULL,
+            posts INTEGER NOT NULL,
+            replies INTEGER NOT NULL,
+            reposts INTEGER NOT NULL,
+            noise_score_day REAL NOT NULL,
+            PRIMARY KEY(did, day)
+        )
+        """
+    )
     conn.commit()
 
 

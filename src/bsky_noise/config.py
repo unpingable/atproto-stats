@@ -31,6 +31,8 @@ APP_DIR = Path(user_config_path("bsky_noise"))
 SESSION_PATH = APP_DIR / "session.json"
 _DB_ENV = os.environ.get("BSKY_DB_PATH")
 DB_PATH = Path(_DB_ENV) if _DB_ENV else APP_DIR / "bsky_noise.db"
+_LOCK_ENV = os.environ.get("BSKY_LOCK_PATH")
+LOCK_PATH = Path(_LOCK_ENV) if _LOCK_ENV else DB_PATH.parent / "run.lock"
 
 
 @dataclass(frozen=True)

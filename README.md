@@ -106,6 +106,8 @@ Materialize derived summary JSON from local data (cron-safe):
 bsky_noise compute --window 7 --compare-prior --summary-output output/summary.json
 ```
 
+`compute` also materializes per-day aggregates used for burst/spike diagnostics.
+
 ## Make Shortcuts
 
 ```bash
@@ -146,6 +148,11 @@ Outputs:
 - `output/summary.json`
 - `output/index.html`
 
+Report health banner status:
+- `good`: clean run receipt
+- `degraded`: retries/rate-limits/timeouts observed
+- `partial`: missing/empty receipt signals
+
 ## Docker
 
 Build and run via compose:
@@ -172,6 +179,7 @@ printf '%s' 'xxxx-xxxx-xxxx-xxxx' | docker compose run --rm bsky-noise auth --ha
 - Quote posts are treated as posts (unless they are replies).
 - Uses SQLite in `~/.config/bsky_noise/bsky_noise.db` (override with `BSKY_DB_PATH`).
 - If you set `XDG_CONFIG_HOME`, config lives at `$XDG_CONFIG_HOME/bsky_noise/`.
+- Overlap lock file defaults to `$(dirname BSKY_DB_PATH)/run.lock` (override with `BSKY_LOCK_PATH`).
 
 ## Project Docs
 

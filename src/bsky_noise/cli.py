@@ -18,8 +18,9 @@ from .candidates import (
     render_pollblue_text,
     score_candidates,
 )
-from .config import SESSION_PATH, load_session, save_session
+from .config import LOCK_PATH, SESSION_PATH, load_session, save_session
 from .db import connect
+from .locking import LockError, file_lock
 from .report import build_summary, write_report
 from .sync import sync_follows
 
@@ -92,18 +93,22 @@ def cmd_sync(args: argparse.Namespace) -> None:
         degraded=args.degraded,
         auto_degraded=args.auto_degraded,
     )
-    if args.dry_run:
-        asyncio.run(
-            sync_follows(
-                conn,
-                client,
-                actor=session.did,
-                windows=args.window,
-                dry_run=True,
-            )
-        )
-        return
-    asyncio.run(sync_follows(conn, client, actor=session.did, windows=args.window))
+    try:
+        with file_lock(LOCK_PATH):
+            if args.dry_run:
+                asyncio.run(
+                    sync_follows(
+                        conn,
+                        client,
+                        actor=session.did,
+                        windows=args.window,
+                        dry_run=True,
+                    )
+                )
+                return
+            asyncio.run(sync_follows(conn, client, actor=session.did, windows=args.window))
+    except LockError as exc:
+        raise SystemExit(exc.message) from exc
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -117,16 +122,20 @@ def cmd_report(args: argparse.Namespace) -> None:
         "reposts": args.w_reposts,
     }
     watchlist = _load_watchlist(args.watchlist)
-    write_report(
-        conn,
-        windows=args.window,
-        output_dir=Path(args.output),
-        weights=weights,
-        compare_prior=args.compare_prior,
-        what_if_mute=args.what_if_mute,
-        watchlist=watchlist,
-        export_csv=Path(args.export_csv) if args.export_csv else None,
-    )
+    try:
+        with file_lock(LOCK_PATH):
+            write_report(
+                conn,
+                windows=args.window,
+                output_dir=Path(args.output),
+                weights=weights,
+                compare_prior=args.compare_prior,
+                what_if_mute=args.what_if_mute,
+                watchlist=watchlist,
+                export_csv=Path(args.export_csv) if args.export_csv else None,
+            )
+    except LockError as exc:
+        raise SystemExit(exc.message) from exc
     console.print(f"Wrote report to {args.output}")
 
 
@@ -138,14 +147,18 @@ def cmd_compute(args: argparse.Namespace) -> None:
         "reposts": args.w_reposts,
     }
     watchlist = _load_watchlist(args.watchlist)
-    summary = build_summary(
-        conn,
-        windows=args.window,
-        weights=weights,
-        compare_prior=args.compare_prior,
-        what_if_mute=args.what_if_mute,
-        watchlist=watchlist,
-    )
+    try:
+        with file_lock(LOCK_PATH):
+            summary = build_summary(
+                conn,
+                windows=args.window,
+                weights=weights,
+                compare_prior=args.compare_prior,
+                what_if_mute=args.what_if_mute,
+                watchlist=watchlist,
+            )
+    except LockError as exc:
+        raise SystemExit(exc.message) from exc
     out = Path(args.summary_output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
