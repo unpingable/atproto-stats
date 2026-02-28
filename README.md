@@ -42,6 +42,8 @@ If you prefer a `.env`, use `.env.example` as a template (keep `.env` uncommitte
 bsky_noise sync --window 30 --window 90
 ```
 
+`sync` always includes your own account feed so the report can show a personal activity panel.
+
 Dry-run to estimate request budget:
 
 ```bash
@@ -148,6 +150,10 @@ did:plc:xxxxxxxxxxxxxxxxxxxxxxx
 Outputs:
 - `output/summary.json`
 - `output/index.html`
+
+`index.html` includes:
+- main feed-noise triage views
+- a "My Account" panel with your own rates, streaks, and recent daily totals
 
 Report health banner status:
 - `good`: clean run receipt

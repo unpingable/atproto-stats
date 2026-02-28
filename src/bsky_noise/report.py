@@ -227,6 +227,136 @@ def _build_rankings(
     }
 
 
+def _streaks(active_days: list[str], *, today: datetime) -> tuple[int, int]:
+    if not active_days:
+        return 0, 0
+    active = sorted({datetime.fromisoformat(d).date() for d in active_days})
+    active_set = set(active)
+
+    longest = 0
+    run = 0
+    prev = None
+    for day in active:
+        if prev is not None and day == prev + timedelta(days=1):
+            run += 1
+        else:
+            run = 1
+        longest = max(longest, run)
+        prev = day
+
+    current = 0
+    cursor = today.date()
+    while cursor in active_set:
+        current += 1
+        cursor -= timedelta(days=1)
+    return current, longest
+
+
+def _self_daily_series(conn, did: str, window_days: int) -> list[dict[str, Any]]:
+    start = (datetime.now(timezone.utc) - timedelta(days=window_days - 1)).date()
+    start_iso = start.isoformat()
+    cur = conn.execute(
+        """
+        SELECT day, posts, replies, reposts, noise_score_day
+        FROM did_day_counts
+        WHERE did = ? AND day >= ?
+        ORDER BY day
+        """,
+        (did, start_iso),
+    )
+    by_day = {
+        row["day"]: {
+            "posts": int(row["posts"] or 0),
+            "replies": int(row["replies"] or 0),
+            "reposts": int(row["reposts"] or 0),
+            "noise_score": float(row["noise_score_day"] or 0.0),
+        }
+        for row in cur.fetchall()
+    }
+    series: list[dict[str, Any]] = []
+    for offset in range(window_days):
+        day = (start + timedelta(days=offset)).isoformat()
+        counts = by_day.get(day, {"posts": 0, "replies": 0, "reposts": 0, "noise_score": 0.0})
+        series.append(
+            {
+                "day": day,
+                "posts": counts["posts"],
+                "replies": counts["replies"],
+                "reposts": counts["reposts"],
+                "noise_score": counts["noise_score"],
+            }
+        )
+    return series
+
+
+def _self_hourly_and_weekday(conn, did: str, start_iso: str, end_iso: str) -> tuple[list[int], list[int]]:
+    hourly = [0] * 24
+    weekdays = [0] * 7
+    cur = conn.execute(
+        """
+        SELECT
+          CAST(strftime('%H', created_at) AS INTEGER) AS hour_utc,
+          CAST(strftime('%w', created_at) AS INTEGER) AS weekday_sun0,
+          COUNT(*) AS c
+        FROM events
+        WHERE did = ? AND created_at >= ? AND created_at < ?
+        GROUP BY hour_utc, weekday_sun0
+        """,
+        (did, start_iso, end_iso),
+    )
+    for row in cur.fetchall():
+        hour = int(row["hour_utc"] or 0)
+        weekday = int(row["weekday_sun0"] or 0)
+        count = int(row["c"] or 0)
+        if 0 <= hour <= 23:
+            hourly[hour] += count
+        # Convert SQLite Sunday=0..Saturday=6 to Monday=0..Sunday=6.
+        weekdays[(weekday - 1) % 7] += count
+    return hourly, weekdays
+
+
+def _build_self_account(
+    conn,
+    *,
+    actor_did: str,
+    windows: list[int],
+    weights: dict[str, float],
+    accounts_by_did: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    base = accounts_by_did.get(actor_did, {})
+    entry: dict[str, Any] = {
+        "did": actor_did,
+        "handle": base.get("handle"),
+        "display_name": base.get("display_name"),
+        "windows": {},
+    }
+    for window in windows:
+        now_iso, start_iso, _ = _window_bounds(window)
+        metrics = _counts_between(conn, actor_did, start_iso, now_iso)
+        rates = _rates(metrics, window)
+        score = _noise_score(metrics, weights)
+        series = _self_daily_series(conn, actor_did, window)
+        active_days = [row["day"] for row in series if row["posts"] + row["replies"] + row["reposts"] > 0]
+        current_streak, longest_streak = _streaks(active_days, today=now)
+        hourly, weekdays = _self_hourly_and_weekday(conn, actor_did, start_iso, now_iso)
+        total = max(metrics.total, 1)
+        entry["windows"][str(window)] = {
+            "counts": metrics.__dict__,
+            "rates": rates,
+            "noise_score": score,
+            "reply_share": metrics.replies / total,
+            "repost_share": metrics.reposts / total,
+            "active_days": len(active_days),
+            "current_streak": current_streak,
+            "longest_streak": longest_streak,
+            "daily": series,
+            "hourly_utc": hourly,
+            "weekday_mon0": weekdays,
+        }
+    return entry
+
+
 def build_summary(
     conn,
     windows: Iterable[int],
@@ -252,10 +382,13 @@ def build_summary(
         "accounts": [],
         "rankings": {},
         "run_health": None,
+        "self_account": None,
     }
 
+    actor_did: str | None = None
     latest_run = get_latest_sync_run(conn)
     if latest_run:
+        actor_did = latest_run["actor"]
         summary["run_health"] = {
             "finished_at": latest_run["finished_at"],
             "follows_count": latest_run["follows_count"],
@@ -326,6 +459,16 @@ def build_summary(
             account["windows"][key]["attention_share"] = account["windows"][key]["noise_score"] / denom
         summary["rankings"][key] = _build_rankings(
             summary["accounts"], key, what_if_mute, watchlist or set()
+        )
+
+    if actor_did:
+        accounts_by_did = {a["did"]: a for a in summary["accounts"]}
+        summary["self_account"] = _build_self_account(
+            conn,
+            actor_did=actor_did,
+            windows=windows,
+            weights=weights,
+            accounts_by_did=accounts_by_did,
         )
 
     return summary
@@ -548,6 +691,7 @@ def _render_html(summary: dict[str, Any]) -> str:
     </div>
 
     <div id=\"overview\" class=\"panel\"></div>
+    <div id=\"selfPanel\" class=\"panel\"></div>
     <div id=\"health\" class=\"panel\"></div>
     <div id=\"watchlistPanel\" class=\"panel hidden\"></div>
 
@@ -578,6 +722,7 @@ def _render_html(summary: dict[str, Any]) -> str:
     const densitySelect = document.getElementById('densitySelect');
     const ratesSelect = document.getElementById('ratesSelect');
     const focusSelect = document.getElementById('focusSelect');
+    const selfPanel = document.getElementById('selfPanel');
     const healthPanel = document.getElementById('health');
     const watchlistPanel = document.getElementById('watchlistPanel');
     const deltaSection = document.getElementById('deltaSection');
@@ -701,6 +846,37 @@ def _render_html(summary: dict[str, Any]) -> str:
       `;
     }
 
+    function renderSelf(windowKey) {
+      const selfData = summary.self_account;
+      if (!selfData || !selfData.windows || !selfData.windows[windowKey]) {
+        selfPanel.innerHTML = '<b>My Account</b><div class=\"note\">No self-account data yet. Run a fresh sync to include your account feed.</div>';
+        return;
+      }
+      const w = selfData.windows[windowKey];
+      const handle = selfData.handle || selfData.did;
+      const days = w.daily || [];
+      const preview = days.slice(-14).map((d) => {
+        const total = d.posts + d.replies + d.reposts;
+        return `${d.day.slice(5)}:${total}`;
+      }).join(' · ');
+      const weekdayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      const topDayIdx = w.weekday_mon0.indexOf(Math.max(...w.weekday_mon0));
+      const topHourIdx = w.hourly_utc.indexOf(Math.max(...w.hourly_utc));
+      selfPanel.innerHTML = `
+        <div><b>My Account</b> · ${handle}</div>
+        <div class=\"cards\" style=\"margin-top:8px;\">
+          <div class=\"card\"><div class=\"k\">Posts/day</div><div class=\"v\">${w.rates.posts_per_day.toFixed(2)}</div></div>
+          <div class=\"card\"><div class=\"k\">Replies/day</div><div class=\"v\">${w.rates.replies_per_day.toFixed(2)}</div></div>
+          <div class=\"card\"><div class=\"k\">Repost share</div><div class=\"v\">${fmtPct(w.repost_share)}</div></div>
+          <div class=\"card\"><div class=\"k\">Active days</div><div class=\"v\">${w.active_days}/${windowKey}</div></div>
+          <div class=\"card\"><div class=\"k\">Current streak</div><div class=\"v\">${w.current_streak}d</div></div>
+          <div class=\"card\"><div class=\"k\">Longest streak</div><div class=\"v\">${w.longest_streak}d</div></div>
+        </div>
+        <div class=\"note\">Recent daily totals: ${preview || 'no activity'}</div>
+        <div class=\"note\">Most active weekday: ${weekdayLabels[topDayIdx] || 'n/a'} · Most active UTC hour: ${topHourIdx}:00</div>
+      `;
+    }
+
     function renderWindow(windowKey) {
       const limit = Number(rowLimit.value);
       const showRates = ratesSelect.value === 'show';
@@ -709,6 +885,7 @@ def _render_html(summary: dict[str, Any]) -> str:
       const watchRows = ranking.watchlist || [];
 
       renderOverview(windowKey, rows);
+      renderSelf(windowKey);
 
       if (watchRows.length > 0) {
         const summaryLine = watchRows

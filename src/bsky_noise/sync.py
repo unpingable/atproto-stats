@@ -134,6 +134,7 @@ async def sync_follows(
     client: XrpcClient,
     actor: str,
     windows: Iterable[int],
+    actor_handle: str | None = None,
     max_accounts: int = 6,
     dry_run: bool = False,
 ) -> None:
@@ -146,7 +147,9 @@ async def sync_follows(
 
     console.print(f"Fetching follows for {actor}...")
     follows = await _collect_follows(client, actor)
-    console.print(f"Found {len(follows)} follows")
+    if all(f.did != actor for f in follows):
+        follows.append(Follow(did=actor, handle=actor_handle, display_name="(you)"))
+    console.print(f"Found {len(follows)} accounts (including your own)")
     if dry_run:
         follow_pages = max(1, (len(follows) + 99) // 100)
         min_requests = follow_pages + len(follows)

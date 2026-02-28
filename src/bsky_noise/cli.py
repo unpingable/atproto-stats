@@ -101,12 +101,21 @@ def cmd_sync(args: argparse.Namespace) -> None:
                         conn,
                         client,
                         actor=session.did,
+                        actor_handle=session.handle,
                         windows=args.window,
                         dry_run=True,
                     )
                 )
                 return
-            asyncio.run(sync_follows(conn, client, actor=session.did, windows=args.window))
+            asyncio.run(
+                sync_follows(
+                    conn,
+                    client,
+                    actor=session.did,
+                    actor_handle=session.handle,
+                    windows=args.window,
+                )
+            )
     except LockError as exc:
         raise SystemExit(exc.message) from exc
 
