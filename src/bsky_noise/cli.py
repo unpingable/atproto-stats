@@ -18,6 +18,15 @@ from .candidates import (
     render_pollblue_text,
     score_candidates,
 )
+from .reciprocity import (
+    _check_visibility,
+    build_status,
+    diff_snapshots,
+    render_diff,
+    render_status,
+    take_snapshot,
+)
+from .label_audit import build_audit, poll_labels, render_audit
 from .config import LOCK_PATH, SESSION_PATH, load_session, save_session
 from .db import connect
 from .locking import LockError, file_lock
@@ -248,6 +257,82 @@ def cmd_candidates_shortlist(args: argparse.Namespace) -> None:
     cmd_candidates_pick(args)
 
 
+def cmd_reciprocity_snapshot(args: argparse.Namespace) -> None:
+    if not SESSION_PATH.exists():
+        raise SystemExit("No session found. Run `bsky_noise auth` first.")
+    session = load_session()
+    conn = connect()
+    client = _make_client(args, session)
+    actor = args.actor or session.did
+    asyncio.run(take_snapshot(conn, client, actor))
+
+
+def cmd_reciprocity_diff(args: argparse.Namespace) -> None:
+    if not SESSION_PATH.exists():
+        raise SystemExit("No session found. Run `bsky_noise auth` first.")
+    session = load_session()
+    conn = connect()
+    actor = args.actor or session.did
+
+    visibility = None
+    if args.check_visibility:
+        # First pass: get the raw diff to find ambiguous DIDs
+        raw = diff_snapshots(conn, actor, prev_id=args.prev, curr_id=args.curr)
+        ambiguous_dids = [
+            t.did for t in raw.get("transitions", [])
+            if t.label in ("they_unfollowed", "mutual_dissolved")
+        ]
+        if ambiguous_dids:
+            client = _make_client(args, session)
+            visibility = asyncio.run(_check_visibility(client, ambiguous_dids))
+
+    result = diff_snapshots(
+        conn, actor, prev_id=args.prev, curr_id=args.curr,
+        visibility=visibility,
+    )
+    console.print(render_diff(result, show_names=args.show_names, limit=args.limit))
+
+
+def cmd_reciprocity_status(args: argparse.Namespace) -> None:
+    if not SESSION_PATH.exists():
+        raise SystemExit("No session found. Run `bsky_noise auth` first.")
+    session = load_session()
+    conn = connect()
+    actor = args.actor or session.did
+    status = build_status(conn, actor)
+    if args.json:
+        console.print(json.dumps(status, indent=2))
+    else:
+        console.print(render_status(status))
+
+
+def cmd_label_audit_poll(args: argparse.Namespace) -> None:
+    if not SESSION_PATH.exists():
+        raise SystemExit("No session found. Run `bsky_noise auth` first.")
+    session = load_session()
+    conn = connect()
+    client = _make_client(args, session)
+    actor = args.actor or session.did
+    asyncio.run(poll_labels(conn, client, actor, max_pages=args.max_pages))
+
+
+def cmd_label_audit_report(args: argparse.Namespace) -> None:
+    if not SESSION_PATH.exists():
+        raise SystemExit("No session found. Run `bsky_noise auth` first.")
+    session = load_session()
+    conn = connect()
+    actor = args.actor or session.did
+    audit = build_audit(
+        conn, actor,
+        retro_threshold_s=args.retro * 3600,
+        window_days=args.window,
+    )
+    if args.json:
+        console.print(json.dumps(audit, indent=2))
+    else:
+        console.print(render_audit(audit, show_late=args.show_late, show_labels=args.show_labels))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bsky_noise")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -350,6 +435,65 @@ def build_parser() -> argparse.ArgumentParser:
     cand_render_short.add_argument("--k", type=int, default=4)
     cand_render_short.add_argument("--format", choices=["text", "pollblue"], default="text")
     cand_render_short.set_defaults(func=cmd_candidates_render)
+
+    recip = sub.add_parser("reciprocity", help="Reciprocity state machine (snapshot + diff)")
+    recip_sub = recip.add_subparsers(dest="recip_cmd", required=True)
+
+    recip_snap = recip_sub.add_parser("snapshot", help="Take a reciprocity snapshot of follows/followers")
+    recip_snap.add_argument("--actor")
+    recip_snap.add_argument("--use-appview", action="store_true", default=True)
+    recip_snap.add_argument("--appview-base", default="https://public.api.bsky.app")
+    recip_snap.add_argument("--verbose", action="store_true")
+    recip_snap.add_argument("--max-retries", type=int, default=6)
+    recip_snap.add_argument("--timeout", type=float, default=30.0)
+    recip_snap.add_argument("--degraded", action="store_true")
+    recip_snap.add_argument("--auto-degraded", action="store_true")
+    recip_snap.set_defaults(func=cmd_reciprocity_snapshot)
+
+    recip_diff = recip_sub.add_parser("diff", help="Diff two reciprocity snapshots")
+    recip_diff.add_argument("--actor")
+    recip_diff.add_argument("--prev", type=int, default=None, help="Previous snapshot ID (default: second-latest)")
+    recip_diff.add_argument("--curr", type=int, default=None, help="Current snapshot ID (default: latest)")
+    recip_diff.add_argument("--show-names", action="store_true", help="Show account names (default: counts only)")
+    recip_diff.add_argument("--limit", type=int, default=10, help="Max names per group when --show-names (default: 10)")
+    recip_diff.add_argument("--check-visibility", action="store_true", help="Resolve profiles to detect blocks/deactivations vs true unfollows")
+    recip_diff.add_argument("--use-appview", action="store_true", default=True)
+    recip_diff.add_argument("--appview-base", default="https://public.api.bsky.app")
+    recip_diff.add_argument("--verbose", action="store_true")
+    recip_diff.add_argument("--max-retries", type=int, default=6)
+    recip_diff.add_argument("--timeout", type=float, default=30.0)
+    recip_diff.add_argument("--degraded", action="store_true")
+    recip_diff.add_argument("--auto-degraded", action="store_true")
+    recip_diff.set_defaults(func=cmd_reciprocity_diff)
+
+    recip_status = recip_sub.add_parser("status", help="Self-audit dashboard: half-life, rates, asymmetry")
+    recip_status.add_argument("--actor")
+    recip_status.add_argument("--json", action="store_true", help="Output as JSON")
+    recip_status.set_defaults(func=cmd_reciprocity_status)
+
+    la = sub.add_parser("label-audit", help="Ex-post-facto label audit on your content")
+    la_sub = la.add_subparsers(dest="la_cmd", required=True)
+
+    la_poll = la_sub.add_parser("poll", help="Poll labels on your content from PDS")
+    la_poll.add_argument("--actor")
+    la_poll.add_argument("--max-pages", type=int, default=20)
+    la_poll.add_argument("--use-appview", action="store_true")
+    la_poll.add_argument("--appview-base", default="https://public.api.bsky.app")
+    la_poll.add_argument("--verbose", action="store_true")
+    la_poll.add_argument("--max-retries", type=int, default=6)
+    la_poll.add_argument("--timeout", type=float, default=30.0)
+    la_poll.add_argument("--degraded", action="store_true")
+    la_poll.add_argument("--auto-degraded", action="store_true")
+    la_poll.set_defaults(func=cmd_label_audit_poll)
+
+    la_report = la_sub.add_parser("report", help="Generate label audit report")
+    la_report.add_argument("--actor")
+    la_report.add_argument("--retro", type=float, default=24, help="Retroactive threshold in hours (default: 24)")
+    la_report.add_argument("--window", type=int, default=None, help="Only look at labels from last N days")
+    la_report.add_argument("--show-late", action="store_true", help="Show individual retroactive labels")
+    la_report.add_argument("--show-labels", action="store_true", help="Show all labeled posts with bsky.app links")
+    la_report.add_argument("--json", action="store_true", help="Output as JSON")
+    la_report.set_defaults(func=cmd_label_audit_report)
 
     return parser
 

@@ -12,6 +12,12 @@ mkdir -p "$REPO_DIR/output" "$REPO_DIR/data"
 BSKY_DB_PATH="$DB_PATH" BSKY_LOCK_PATH="$LOCK_PATH" .venv/bin/python -m bsky_noise.cli sync \
   --window 7 --window 30 --use-appview --concurrency 1 --auto-degraded >> "$LOG_PATH" 2>&1
 
+BSKY_DB_PATH="$DB_PATH" .venv/bin/python -m bsky_noise.cli reciprocity snapshot \
+  --use-appview --auto-degraded >> "$LOG_PATH" 2>&1
+
+BSKY_DB_PATH="$DB_PATH" .venv/bin/python -m bsky_noise.cli label-audit poll \
+  --auto-degraded >> "$LOG_PATH" 2>&1
+
 BSKY_DB_PATH="$DB_PATH" BSKY_LOCK_PATH="$LOCK_PATH" .venv/bin/python -m bsky_noise.cli compute \
   --window 7 --window 30 --compare-prior --summary-output "$REPO_DIR/output/summary.json" >> "$LOG_PATH" 2>&1
 

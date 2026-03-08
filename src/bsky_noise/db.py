@@ -144,6 +144,99 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reciprocity_snapshot (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            taken_at TEXT NOT NULL,
+            actor_did TEXT NOT NULL,
+            following_count INTEGER NOT NULL,
+            follower_count INTEGER NOT NULL,
+            complete INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS snapshot_following (
+            run_id INTEGER NOT NULL REFERENCES reciprocity_snapshot(id),
+            did TEXT NOT NULL,
+            PRIMARY KEY(run_id, did)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_following_did ON snapshot_following(did)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS snapshot_followers (
+            run_id INTEGER NOT NULL REFERENCES reciprocity_snapshot(id),
+            did TEXT NOT NULL,
+            PRIMARY KEY(run_id, did)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_followers_did ON snapshot_followers(did)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mutual_edges (
+            actor_did TEXT NOT NULL,
+            did TEXT NOT NULL,
+            first_mutual_at TEXT NOT NULL,
+            last_mutual_at TEXT NOT NULL,
+            currently_mutual INTEGER NOT NULL DEFAULT 1,
+            num_breaks INTEGER NOT NULL DEFAULT 0,
+            num_rejoins INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(actor_did, did)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS asymmetry_edges (
+            actor_did TEXT NOT NULL,
+            did TEXT NOT NULL,
+            state TEXT NOT NULL,
+            since TEXT NOT NULL,
+            PRIMARY KEY(actor_did, did)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS my_labels (
+            src TEXT NOT NULL,
+            uri TEXT NOT NULL,
+            val TEXT NOT NULL,
+            cts TEXT NOT NULL,
+            neg INTEGER NOT NULL DEFAULT 0,
+            cid TEXT,
+            exp TEXT,
+            ingested_at TEXT NOT NULL,
+            PRIMARY KEY(src, uri, val, cts)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_my_labels_uri_cts ON my_labels(uri, cts)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_my_labels_val_cts ON my_labels(val, cts)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_my_labels_src_cts ON my_labels(src, cts)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS label_poll_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
 
 
@@ -391,6 +484,62 @@ def write_candidate_score(
             reposts,
         ),
     )
+
+
+def write_reciprocity_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    taken_at: str,
+    actor_did: str,
+    following_dids: Iterable[str],
+    follower_dids: Iterable[str],
+) -> int:
+    following_list = list(following_dids)
+    follower_list = list(follower_dids)
+    try:
+        conn.execute("BEGIN")
+        cur = conn.execute(
+            """
+            INSERT INTO reciprocity_snapshot
+                (taken_at, actor_did, following_count, follower_count, complete)
+            VALUES (?, ?, ?, ?, 0)
+            """,
+            (taken_at, actor_did, len(following_list), len(follower_list)),
+        )
+        run_id = cur.lastrowid
+        if following_list:
+            conn.executemany(
+                "INSERT INTO snapshot_following (run_id, did) VALUES (?, ?)",
+                [(run_id, d) for d in following_list],
+            )
+        if follower_list:
+            conn.executemany(
+                "INSERT INTO snapshot_followers (run_id, did) VALUES (?, ?)",
+                [(run_id, d) for d in follower_list],
+            )
+        conn.execute(
+            "UPDATE reciprocity_snapshot SET complete = 1 WHERE id = ?", (run_id,)
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return run_id
+
+
+def get_latest_reciprocity_snapshots(
+    conn: sqlite3.Connection, actor_did: str, n: int = 2
+) -> list[sqlite3.Row]:
+    cur = conn.execute(
+        """
+        SELECT * FROM reciprocity_snapshot
+        WHERE actor_did = ? AND complete = 1
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (actor_did, n),
+    )
+    return list(cur.fetchall())
 
 
 def list_candidate_scores(conn: sqlite3.Connection, actor_did: str, mode: str) -> list[sqlite3.Row]:

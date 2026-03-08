@@ -178,3 +178,17 @@ class XrpcClient:
         if cursor:
             params["cursor"] = cursor
         return await self._request("GET", "app.bsky.feed.getAuthorFeed", params=params)
+
+    async def query_labels(
+        self,
+        uri_patterns: list[str],
+        sources: list[str] | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"uriPatterns": uri_patterns, "limit": limit}
+        if sources:
+            params["sources"] = sources
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request("GET", "com.atproto.label.queryLabels", params=params)
